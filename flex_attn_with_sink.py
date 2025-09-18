@@ -66,13 +66,13 @@ def flex_attn_with_sink_func(
         attention_mask: Optional[torch.Tensor] = None,  # [b, n, sq, skv]
         scaling: Optional[float] = None,
         num_key_value_groups: int = 8,
-        dropout: float = 0.0,
         is_causal: bool = False,
-        training: bool = False,
         **kwargs,
 ):
-    assert dropout == 0.0, f'{dropout=} is not supported!'
-    assert attention_mask is None, f'flex_attn_with_sink_func only supports attention_mask == None!'
+    assert (dropout := kwargs.get('dropout', 0.0) == 0.0), \
+        f'{dropout=} is not supported!'
+    assert attention_mask is None or not is_causal, \
+        'attention_mask is not None, so is_causal must be False!'
     b, n, sq, d = query.shape
 
     key = repeat_kv(key, num_key_value_groups)
@@ -97,39 +97,40 @@ def flex_attn_with_sink_func(
         value=0.0,
     )
 
-    def score_mod_causal(
-            score: torch.Tensor,
-            b_idx: torch.Tensor,
-            n_idx: torch.Tensor,
-            q_idx: torch.Tensor,
-            kv_idx: torch.Tensor,
-    ):
-        score = torch.where(
-            kv_idx == sk,
-            sinks[n_idx],
-            torch.where(
-                q_idx >= kv_idx,
-                score,
-                torch.finfo(score.dtype).min,
+    if is_causal:
+        def score_mod(
+                score: torch.Tensor,
+                b_idx: torch.Tensor,
+                n_idx: torch.Tensor,
+                q_idx: torch.Tensor,
+                kv_idx: torch.Tensor,
+        ):
+            score = torch.where(
+                kv_idx == sk,
+                sinks[n_idx],
+                torch.where(
+                    q_idx >= kv_idx,
+                    score,
+                    torch.finfo(score.dtype).min,
+                )
             )
-        )
-        return score
-
-    def score_mod(
-            score: torch.Tensor,
-            b_idx: torch.Tensor,
-            n_idx: torch.Tensor,
-            q_idx: torch.Tensor,
-            kv_idx: torch.Tensor,
-    ) -> torch.Tensor:
-        score = torch.where(kv_idx == sk, sinks[n_idx], score)
-        return score
+            return score
+    else:
+        def score_mod(
+                score: torch.Tensor,
+                b_idx: torch.Tensor,
+                n_idx: torch.Tensor,
+                q_idx: torch.Tensor,
+                kv_idx: torch.Tensor,
+        ) -> torch.Tensor:
+            score = torch.where(kv_idx == sk, sinks[n_idx], score)
+            return score
 
     attn_output = flex_attention(
         query,
         dummy_key,
         dummy_value,
-        score_mod=score_mod_causal if is_causal else score_mod,
+        score_mod=score_mod,
         block_mask=None,
         scale=scaling,
         enable_gqa=False,
