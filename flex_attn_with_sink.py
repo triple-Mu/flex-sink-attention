@@ -63,14 +63,16 @@ def flex_attn_with_sink_func(
         key: torch.Tensor,  # [b, n, skv, d]
         value: torch.Tensor,  # [b, n, skv, d]
         sinks: torch.Tensor,  # [n]
-        attention_mask: Optional[torch.Tensor],  # [b, n, sq, skv]
+        attention_mask: Optional[torch.Tensor] = None,  # [b, n, sq, skv]
         scaling: Optional[float] = None,
         num_key_value_groups: int = 8,
         dropout: float = 0.0,
+        is_causal: bool = False,
         training: bool = False,
         **kwargs,
 ):
     assert dropout == 0.0, f'{dropout=} is not supported!'
+    assert attention_mask is None, f'flex_attn_with_sink_func only supports attention_mask == None!'
     b, n, sq, d = query.shape
 
     key = repeat_kv(key, num_key_value_groups)
@@ -82,16 +84,6 @@ def flex_attn_with_sink_func(
 
     if scaling is None:
         scaling = d ** -0.5
-
-    if attention_mask is not None:
-        attention_mask = F.pad(
-            attention_mask,
-            (0, 1, 0, 0, 0, 0, 0, 0),
-            mode='constant',
-            # 0.0 means have an impact on softmax
-            # -float('inf') means have no impact on softmax
-            value=0.0,
-        )
 
     dummy_key = F.pad(
         key,
@@ -105,6 +97,24 @@ def flex_attn_with_sink_func(
         value=0.0,
     )
 
+    def score_mod_causal(
+            score: torch.Tensor,
+            b_idx: torch.Tensor,
+            n_idx: torch.Tensor,
+            q_idx: torch.Tensor,
+            kv_idx: torch.Tensor,
+    ):
+        score = torch.where(
+            kv_idx == sk,
+            sinks[n_idx],
+            torch.where(
+                q_idx >= kv_idx,
+                score,
+                torch.finfo(score.dtype).min,
+            )
+        )
+        return score
+
     def score_mod(
             score: torch.Tensor,
             b_idx: torch.Tensor,
@@ -112,8 +122,6 @@ def flex_attn_with_sink_func(
             q_idx: torch.Tensor,
             kv_idx: torch.Tensor,
     ) -> torch.Tensor:
-        if attention_mask is not None:
-            score = score + attention_mask[b_idx, n_idx, q_idx, kv_idx]
         score = torch.where(kv_idx == sk, sinks[n_idx], score)
         return score
 
@@ -121,7 +129,7 @@ def flex_attn_with_sink_func(
         query,
         dummy_key,
         dummy_value,
-        score_mod=score_mod,
+        score_mod=score_mod_causal if is_causal else score_mod,
         block_mask=None,
         scale=scaling,
         enable_gqa=False,
@@ -135,41 +143,84 @@ def flex_attn_with_sink_func(
 def test():
     dtype = torch.bfloat16
     device = torch.device('cuda:0')
+
     num_key_value_groups = 8
-    b, n, sq, skv, d = 1, 40, 1024, 1024, 128
+    b, n, sq, skv, d = 1, 40, 4096, 4096, 128
     query = torch.randn((b, n, sq, d), device=device, dtype=dtype)
     key = torch.randn((b, n // num_key_value_groups, skv, d), device=device, dtype=dtype)
     value = torch.randn((b, n // num_key_value_groups, skv, d), device=device, dtype=dtype)
     sinks = torch.randn((n,), device=device, dtype=dtype)
-    attention_mask = None
 
-    gt, _ = eager_attention_forward(
-        query=query,
-        key=key,
-        value=value,
-        sinks=sinks,
-        attention_mask=attention_mask,
-        scaling=None,
-        num_key_value_groups=num_key_value_groups,
-        dropout=0.0,
-        training=False,
-    )
+    attention_causal_mask = torch.triu(
+        torch.full((sq, skv), torch.finfo(dtype).min), diagonal=1,
+    )[None, None].to(device=device, dtype=dtype)
 
-    pred = flex_attn_with_sink_func(
-        query=query,
-        key=key,
-        value=value,
-        sinks=sinks,
-        attention_mask=attention_mask,
-        scaling=None,
-        num_key_value_groups=num_key_value_groups,
-        dropout=0.0,
-        training=False,
-    )
+    def run_full_attention():
+        gt, _ = eager_attention_forward(
+            query=query,
+            key=key,
+            value=value,
+            sinks=sinks,
+            attention_mask=None,
+            scaling=None,
+            num_key_value_groups=num_key_value_groups,
+            dropout=0.0,
+            training=False,
+        )
 
-    diff = gt - pred.permute(0, 2, 1, 3)
+        pred = flex_attn_with_sink_func(
+            query=query,
+            key=key,
+            value=value,
+            sinks=sinks,
+            attention_mask=None,
+            scaling=None,
+            num_key_value_groups=num_key_value_groups,
+            dropout=0.0,
+            is_causal=False,
+            training=False,
+        ).permute(0, 2, 1, 3)
 
-    print(f'mean: {diff.mean().item():.7f}, max: {diff.max().item():.7f}, min: {diff.min().item():.7f}')
+        return gt, pred
+
+    def run_casual_attention():
+        gt, _ = eager_attention_forward(
+            query=query,
+            key=key,
+            value=value,
+            sinks=sinks,
+            attention_mask=attention_causal_mask,
+            scaling=None,
+            num_key_value_groups=num_key_value_groups,
+            dropout=0.0,
+            training=False,
+        )
+
+        pred = flex_attn_with_sink_func(
+            query=query,
+            key=key,
+            value=value,
+            sinks=sinks,
+            attention_mask=None,
+            scaling=None,
+            num_key_value_groups=num_key_value_groups,
+            dropout=0.0,
+            is_causal=True,
+            training=False,
+        ).permute(0, 2, 1, 3)
+
+        return gt, pred
+
+    for fn in [run_full_attention, run_casual_attention]:
+        gt, pred = fn()
+        diff = gt - pred
+
+        print('*' * 100)
+        if not torch.allclose(gt, pred, rtol=1e-3, atol=1e-2):
+            print(f'{fn.__name__} is not allclose!')
+            print(f'mean: {diff.mean().item():.7f}, max: {diff.max().item():.7f}, min: {diff.min().item():.7f}')
+        else:
+            print(f'{fn.__name__} is allclose!')
 
 
 if __name__ == '__main__':
